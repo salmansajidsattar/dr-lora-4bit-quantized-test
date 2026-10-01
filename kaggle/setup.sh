@@ -27,9 +27,13 @@ PYTHONPATH="$WORK/open-instruct" python -c "import open_instruct.finetune_colm; 
 
 echo "== 4. data: MetaMathQA (GSM8K part), first $N_SAMPLES examples"
 DATA="$WORK/data/metamathqa_gsm8k_${N_SAMPLES}.jsonl"
-if [ ! -f "$DATA" ]; then
+if [ ! -s "$DATA" ]; then     # missing or empty
     python "$REPO/data/convert_metamathqa_to_tulu.py" --gsm8k_only \
         --max_samples "$N_SAMPLES" --output_path "$DATA"
 fi
-wc -l "$DATA"
+N=$(wc -l < "$DATA")
+echo "$N examples in $DATA"
+if [ "$N" -eq 0 ]; then
+    echo "ERROR: no training examples were written"; exit 1
+fi
 echo "setup OK"

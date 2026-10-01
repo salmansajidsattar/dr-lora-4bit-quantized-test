@@ -50,7 +50,7 @@ except ImportError:
 # Examples of MetaMathQA type field values:
 #   GSM8K_Backward       GSM8K_FOBAR        GSM8K_Rephrased
 #   GSM8K_SV             MATH_Backward      MATH_FOBAR  ...
-GSM8K_TYPE_PREFIXES = ("GSM8K",)
+GSM8K_TYPE_PREFIXES = ("GSM_",)  # [fix] real MetaMathQA types: GSM_AnsAug, GSM_Rephrased, GSM_SV, GSM_FOBAR
 
 
 def is_gsm8k(example: dict) -> bool:
