@@ -14,6 +14,15 @@ Every change is marked `[4-bit patch]`. DR-LoRA's growth method is untouched.
 4. **Finding the experts.** Expert layers are found when they are `Linear4bit` too, not only `Linear`.
 5. **No final merge.** With `--use_qlora`, the step that merges LoRA into the model is skipped, because merging into 4-bit weights isn't exact. The LoRA adapter is still saved.
 
+## Bug fixes to the official code (also in `finetune/finetune.py`)
+
+1. **Router top-k (`[fix]`).** The routing hook sits on `mlp.gate`, a plain `Linear` that does not store top-k, so the code fell back to **2**. OLMoE actually routes **top-8** (Qwen1.5-MoE: top-4). This affected:
+   - the routing frequency f, which counted only 2 experts per token;
+   - which experts' LoRA gradients were kept: some experts that were really used got zero gradient.
+
+   The hook now reads top-k from the MoE block (`mlp.top_k`).
+2. **Hidden logs (`[4-bit patch]`).** On Kaggle, some library sets up logging first at WARNING level, so every INFO line was hidden: loss, rank growth and "Training finished". The root logger is now set to INFO.
+
 ## Steps on Kaggle
 
 Notebook settings: Accelerator **GPU T4 x2**, Internet **On**.

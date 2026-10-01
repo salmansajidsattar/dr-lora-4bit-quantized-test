@@ -13,6 +13,8 @@ OUT = os.environ.get("OUT", f"{WORK}/out_drlora_4bit")
 LOG = os.environ.get("LOG", f"{WORK}/train_test.log")
 N_LAYERS = int(os.environ.get("N_LAYERS", 16))      # OLMoE-1B-7B
 MIN_EVENTS = int(os.environ.get("MIN_EVENTS", 3))   # 20 steps, every 5
+TOP_K = int(os.environ.get("TOP_K", 8))             # OLMoE routes top-8
+R_INIT = int(os.environ.get("R_INIT", 8))
 
 log = open(LOG).read()
 all_ok = True
@@ -24,28 +26,38 @@ def check(name, passed, detail=""):
     print(f"[{'PASS' if passed else 'FAIL'}] {name} {detail}")
 
 
-check("loaded in 4-bit", "use_qlora=True" in log)
+logs = sorted(glob.glob(f"{OUT}/adalora_rank_logs/*.json"))
+adapter = os.path.exists(f"{OUT}/adapter_model.safetensors")
+
+check("loaded in 4-bit", "use_qlora=True" in log,
+      "" if "use_qlora=True" in log else "(INFO log lines missing)")
 check("finished without error",
-      "Traceback" not in log and "Training finished" in log)
+      "Traceback" not in log and ("Training finished" in log or adapter))
 
 gate = re.findall(r"\[GateHook\] logits shape=torch.Size\(\[(\d+), (\d+)\]\)",
                   log)
 check("routing recorded", bool(gate),
       f"(router output tokens x experts: {gate[0] if gate else None})")
+k = re.findall(r"selected shape=torch.Size\(\[\d+, (\d+)\]\)", log)
+check(f"router top-k = {TOP_K}", bool(k) and int(k[0]) == TOP_K,
+      f"(recorded top-{k[0] if k else '?'})")
 
 grows = re.findall(r"\[AdaLoRA-Grow\] layer \d+: grew \d+ ranks", log)
 events = len(grows) // N_LAYERS
-check("ranks grew", events >= MIN_EVENTS,
-      f"({events} growth events x {N_LAYERS} layers)")
+grew_files = False
+if logs:
+    last = json.load(open(logs[-1]))["per_module_rank"].values()
+    grew_files = any(m["active_rank"] > R_INIT for m in last)
+check("ranks grew", events >= MIN_EVENTS or (not grows and grew_files),
+      f"({events} growth events x {N_LAYERS} layers in log; "
+      f"rank files show growth: {grew_files})")
 
 losses = [float(x) for x in
           re.findall(r"Step: \d+, Loss: ([0-9.eE+-]+|nan|inf)", log)]
 check("loss finite", bool(losses) and all(x == x and x < 1e4 for x in losses),
       f"{losses}")
-check("LoRA adapter saved",
-      os.path.exists(f"{OUT}/adapter_model.safetensors"))
+check("LoRA adapter saved", adapter)
 
-logs = sorted(glob.glob(f"{OUT}/adalora_rank_logs/*.json"))
 if logs:
     snap = json.load(open(logs[-1]))
     ranks = [m["active_rank"] for m in snap["per_module_rank"].values()]

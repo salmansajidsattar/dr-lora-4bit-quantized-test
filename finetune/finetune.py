@@ -32,6 +32,7 @@ with contextlib.suppress(Exception):
 # isort: on
 
 import json
+import logging  # [4-bit patch]
 import math
 import shutil
 import time
@@ -752,6 +753,9 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     )
 
     logger_utils.setup_logger()
+    # [4-bit patch] some platforms (e.g. Kaggle) set up logging first at WARNING,
+    # which hides every INFO line (loss, rank growth, finish). Show them.
+    logging.getLogger().setLevel(logging.INFO)
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
@@ -914,8 +918,11 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                                     logits = output.float()
 
                                 if logits is not None:
+                                    # [fix] mlp.gate is a plain Linear with no top_k, so the original fell
+                                    # back to 2; OLMoE routes top-8 and Qwen1.5-MoE top-4 (mlp.top_k).
                                     top_k = getattr(module, "top_k", None) or getattr(
-                                        getattr(module, "config", None), "num_experts_per_tok", None) or 2
+                                        getattr(module, "config", None), "num_experts_per_tok", None) or getattr(
+                                        target_mlp, "top_k", None) or 2
                                     _, selected = torch.topk(logits, top_k, dim=-1)
                                     target_mlp._last_selected_experts = selected.detach()
 
