@@ -785,7 +785,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             quantization_config=BitsAndBytesConfig(
                 load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
                 bnb_4bit_compute_dtype=model_dtype, llm_int8_skip_modules=keep),
-            device_map={"": accelerator.device},
+            # accelerate needs an integer GPU index here (a bare "cuda" device crashes it)
+            device_map={"": torch.cuda.current_device() if torch.cuda.is_available() else "cpu"},
         )
     logger.info(f"[4-bit patch] dtype={model_dtype}, use_qlora={args.use_qlora}")
     model = AutoModelForCausalLM.from_pretrained(
