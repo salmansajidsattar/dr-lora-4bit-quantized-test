@@ -1,0 +1,3 @@
+# Keep Unix line endings so the scripts run on Kaggle (Linux)
+*.sh text eol=lf
+*.py text eol=lf
