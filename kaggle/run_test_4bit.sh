@@ -18,13 +18,26 @@ LOG=${LOG:-$WORK/train_test.log}
 LAUNCH=${LAUNCH:-"--num_processes 1 --mixed_precision fp16"}
 OPTIM_8BIT=${OPTIM_8BIT:-True}      # bitsandbytes 8-bit AdamW (GPU only)
 SEQ_LEN=${SEQ_LEN:-512}
+WARMUP=${WARMUP:-0.1}                # paper: 0.03
+LOG_EVERY=${LOG_EVERY:-$GROW_EVERY}
+CKPT_EVERY=${CKPT_EVERY:-}           # e.g. 250: checkpoint (and resume point)
+RESUME=${RESUME:-0}                  # 1: keep $OUT and resume from its checkpoint
 
 export HF_HOME=${HF_HOME:-/kaggle/tmp/hf}   # 14 GB model, off /kaggle/working
 export WANDB_MODE=disabled TOKENIZERS_PARALLELISM=false
 export PYTHONPATH="$WORK/open-instruct"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 mkdir -p "$HF_HOME"
-rm -rf "$OUT"
+if [ "$RESUME" = "1" ]; then
+    echo "resuming if a checkpoint exists in $OUT"
+else
+    rm -rf "$OUT"
+    : > "$LOG"
+fi
+CKPT_ARGS=""
+if [ -n "$CKPT_EVERY" ]; then
+    CKPT_ARGS="--checkpointing_steps $CKPT_EVERY --keep_last_n_checkpoints 1"
+fi
 
 # GPU memory every 5 s, for the check script
 MEM_PID=""
@@ -41,8 +54,8 @@ accelerate launch $LAUNCH open_instruct/finetune_colm.py \
     --dataset_skip_cache True --chat_template_name tulu --add_bos True \
     --use_flash_attn False --max_seq_length "$SEQ_LEN" --preprocessing_num_workers 2 \
     --per_device_train_batch_size 4 --gradient_accumulation_steps 1 \
-    --learning_rate 2e-5 --lr_scheduler_type linear --warmup_ratio 0.1 \
-    --weight_decay 0.0 --max_train_steps "$STEPS" --logging_steps "$GROW_EVERY" \
+    --learning_rate 2e-5 --lr_scheduler_type linear --warmup_ratio "$WARMUP" \
+    --weight_decay 0.0 --max_train_steps "$STEPS" --logging_steps "$LOG_EVERY" $CKPT_ARGS \
     --seed 42 --low_cpu_mem_usage True --output_dir "$OUT" \
     --clean_checkpoints_at_end False --with_tracking False --push_to_hub False \
     --try_launch_beaker_eval_jobs False --try_auto_save_to_beaker False \
@@ -54,7 +67,7 @@ accelerate launch $LAUNCH open_instruct/finetune_colm.py \
     --adalora_target_rank 16 --adalora_max_rank 32 \
     --adalora_grow_interval "$GROW_EVERY" --adalora_beta 0.9 \
     --adalora_usage_decay 0.9 --adalora_module_grow_frac 0.1 \
-    2>&1 | tee "$LOG"
+    2>&1 | tee -a "$LOG"
 STATUS=${PIPESTATUS[0]}
 
 [ -n "$MEM_PID" ] && kill "$MEM_PID" 2>/dev/null || true

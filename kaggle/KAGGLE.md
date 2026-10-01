@@ -12,7 +12,9 @@ Every change is marked `[4-bit patch]`. DR-LoRA's growth method is untouched.
 2. **dtype follows the GPU.** bf16 on Ampere or newer, fp16 on T4, fp32 on CPU. The original hard-coded bf16.
 3. **8-bit optimizer.** `--use_8bit_optimizer True` now uses bitsandbytes AdamW8bit (it also did nothing before).
 4. **Finding the experts.** Expert layers are found when they are `Linear4bit` too, not only `Linear`.
-5. **No final merge.** With `--use_qlora`, the step that merges LoRA into the model is skipped, because merging into 4-bit weights isn't exact. The LoRA adapter is still saved.
+5. **No final merge.** With `--use_qlora`, the step that merges LoRA into the model is skipped, because merging into 4-bit weights isn't exact. The LoRA adapter is saved, and the trained router is saved as `router_state_dict.pt`.
+6. **Integer GPU index.** `device_map` uses `torch.cuda.current_device()`; accelerate 1.12 crashes on a device with no index.
+7. **Resume.** Resuming loads checkpoints non-strictly, because the frozen 4-bit base weights' quantization constants can't be loaded back strictly. LoRA, router, optimizer, scheduler and DR-LoRA state are all restored.
 
 ## Bug fixes to the official code (also in `finetune/finetune.py`)
 
@@ -53,6 +55,33 @@ A longer run reuses the same script with environment variables:
 !STEPS=300 GROW_EVERY=50 bash /kaggle/working/dr-lora/kaggle/run_test_4bit.sh
 !MIN_EVENTS=5 python /kaggle/working/dr-lora/kaggle/check_run.py
 ```
+
+## Full run (about 9 h) and GSM8K evaluation
+
+**Training: the paper's schedule at batch 4.**
+- Same as the paper: 3,750 steps, growth every 200 steps after 3% warm-up (18 events), lr 2e-5, rank 8 → 16, max rank 32.
+- Different: batch 4 instead of 48, so it sees 15,000 MetaMathQA examples (one pass) instead of 180,000.
+- A checkpoint is saved every 250 steps; running the script again resumes from the latest one.
+
+The run takes about 9 hours, so use **Save Version → Save & Run All** (runs in the background, up to 12 h). Notebook cells:
+
+```
+!git clone https://github.com/<you>/<repo>.git /kaggle/working/dr-lora-4bit-quantized-test
+!bash /kaggle/working/dr-lora-4bit-quantized-test/kaggle/setup.sh
+!bash /kaggle/working/dr-lora-4bit-quantized-test/kaggle/run_full_4bit.sh
+!OUT=/kaggle/working/out_drlora_4bit_full LOG=/kaggle/working/train_full.log MIN_EVENTS=18 python /kaggle/working/dr-lora-4bit-quantized-test/kaggle/check_run.py
+```
+
+**Evaluation** (`eval_gsm8k_4bit.py`) matches DR-LoRA's `eval/eval_gsm8k.sh`: lm-eval `gsm8k_cot`, 8-shot, greedy, chat template on, batch 8. It loads the 4-bit base, the saved adapter and the trained router. Run it in a new session, with the training version's output added as input:
+
+```
+!pip install -q "lm-eval[hf]==0.4.11"
+!python .../kaggle/eval_gsm8k_4bit.py --run_dir /kaggle/input/<notebook>/out_drlora_4bit_full --limit 50   # timing test
+!python .../kaggle/eval_gsm8k_4bit.py --run_dir /kaggle/input/<notebook>/out_drlora_4bit_full             # all 1,319
+!python .../kaggle/eval_gsm8k_4bit.py --no_adapter                                                         # 4-bit base model
+```
+
+It prints `strict-match` (requires "The answer is N") and `flexible-extract` (last number). MetaMathQA teaches the format "The answer is: N", with a colon, which strict-match misses, so flexible-extract is the comparable number.
 
 ## Why transformers 4.57.6 (not 5.x)
 

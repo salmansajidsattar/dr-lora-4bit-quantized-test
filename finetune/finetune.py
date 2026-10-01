@@ -1082,7 +1082,10 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     last_checkpoint_path = get_last_checkpoint_path(args)
     if last_checkpoint_path:
         accelerator.print(f"Resumed from checkpoint: {last_checkpoint_path}")
-        accelerator.load_state(last_checkpoint_path)
+        # [4-bit patch] the checkpoint also holds the frozen 4-bit base weights' quantization
+        # constants, which PEFT will not load back strictly. Only LoRA, router, optimizer and
+        # scheduler change during training, and those are all restored.
+        accelerator.load_state(last_checkpoint_path, strict=not args.use_qlora)
         if adalora_state: _restore_adalora_state(adalora_state, last_checkpoint_path, accelerator)
         training_difference = os.path.splitext(os.path.basename(last_checkpoint_path))[0]
         if "epoch" in training_difference:
@@ -1231,6 +1234,15 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     #       - Load the complete state_dict into unwrapped_model.
     #       - Call merge_and_unload() with correct full weights.
     #       - Save the merged model.
+    if args.use_lora and args.use_qlora and not args.freeze_moe_router:
+        # [4-bit patch] the adapter saved above has no router weights, but DR-LoRA trains the
+        # router after warm-up. Save them next to the adapter for evaluation.
+        router_state = {k: v.cpu() for k, v in accelerator.get_state_dict(model).items()
+                        if ".gate." in k and "lora_" not in k}
+        if accelerator.is_main_process:
+            torch.save(router_state, os.path.join(args.output_dir, "router_state_dict.pt"))
+            logger.info(f"[4-bit patch] saved {len(router_state)} router tensors to {args.output_dir}")
+
     if args.use_lora and not args.use_qlora:  # [4-bit patch] adapter is saved above
         logger.info("Merging LoRA adapters and saving the full model...")
         final_model_dir = os.path.join(args.output_dir, "final_merged_model")
