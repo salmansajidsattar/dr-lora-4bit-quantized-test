@@ -56,28 +56,36 @@ A longer run reuses the same script with environment variables:
 !MIN_EVENTS=5 python /kaggle/working/dr-lora/kaggle/check_run.py
 ```
 
-## Full run (about 9–10 h, both T4s) and GSM8K evaluation
+## Full run (about 6 h on both T4s) and GSM8K evaluation
 
-**Training: the paper's schedule at batch 8 (4 per GPU, 2 T4s).**
-- Same as the paper: 3,750 steps, growth every 200 steps after 3% warm-up (18 events), lr 2e-5, rank 8 → 16, max rank 32.
-- Different: batch 8 instead of 48, so it sees 30,000 MetaMathQA examples (one pass) instead of 180,000.
-- Set the notebook accelerator to **GPU T4 x2**. `NGPU=1` gives the old 1-GPU run (batch 4, 15,000 examples).
-- A checkpoint is saved every 250 steps; running the script again resumes from the latest one.
+**Training: 15,000 examples at batch 8 (4 per GPU, 2 T4s).**
+- 1,875 steps, growth every 100 steps after 3% warm-up (18 events), lr 2e-5, rank 8 → 16, max rank 32.
+- The paper: 3,750 steps at batch 48 (180,000 examples). Same data as the earlier 1-GPU run, in half the steps.
+- Set the notebook accelerator to **GPU T4 x2**. `NGPU=1` gives the old 1-GPU run (3,750 steps, about 9 h).
+- Speed on 2 T4s: about 11.3 s per step, so about 6 h. A checkpoint is saved every 125 steps.
 
-Test both GPUs first (20 steps, a few minutes); `check_run.py` then also checks "2 GPUs in sync" and prints the time per step:
+Test both GPUs first (20 steps, a few minutes); `check_run.py` then also checks "2 GPUs in sync":
 
 ```
 !NGPU=2 bash /kaggle/working/dr-lora-4bit-quantized-test/kaggle/run_test_4bit.sh
 !python /kaggle/working/dr-lora-4bit-quantized-test/kaggle/check_run.py
 ```
 
-The run takes about 9 hours, so use **Save Version → Save & Run All** (runs in the background, up to 12 h). Do not run it in an interactive session: when that session ends, `/kaggle/working` is deleted and the trained adapter is lost. Only a saved version keeps its files (Output tab). Notebook cells:
+Use **Save Version → Save & Run All** (runs in the background, up to 12 h). Do not run it in an interactive session: when that session ends, `/kaggle/working` is deleted. Only a saved version keeps its files (Output tab).
+
+Notebook cells:
 
 ```
 !git clone https://github.com/<you>/<repo>.git /kaggle/working/dr-lora-4bit-quantized-test
 !bash /kaggle/working/dr-lora-4bit-quantized-test/kaggle/setup.sh
 !bash /kaggle/working/dr-lora-4bit-quantized-test/kaggle/run_full_4bit.sh
 !OUT=/kaggle/working/out_drlora_4bit_full LOG=/kaggle/working/train_full.log python /kaggle/working/dr-lora-4bit-quantized-test/kaggle/check_run.py
+```
+
+If a run is cut short (training stops cleanly after `TIME_LIMIT`, default 11 h), start a new version with the old output added as input (Add Input → Your Work) and resume:
+
+```
+!RESUME_FROM=/kaggle/input/<notebook>/out_drlora_4bit_full bash /kaggle/working/dr-lora-4bit-quantized-test/kaggle/run_full_4bit.sh
 ```
 
 **Evaluation** (`eval_gsm8k_4bit.py`) matches DR-LoRA's `eval/eval_gsm8k.sh`: lm-eval `gsm8k_cot`, 8-shot, greedy, chat template on, batch 8. It loads the 4-bit base, the saved adapter and the trained router. Run it in a new session, with the training version's output added as input:

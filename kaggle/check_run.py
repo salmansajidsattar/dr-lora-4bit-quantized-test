@@ -31,8 +31,11 @@ adapter = os.path.exists(f"{OUT}/adapter_model.safetensors")
 
 check("loaded in 4-bit", "use_qlora=True" in log,
       "" if "use_qlora=True" in log else "(INFO log lines missing)")
+# a 2-part run: part 1 ends at the time limit (SIGTERM traceback), so only
+# check the log after the last resume
+last_part = log[log.rfind("Resumed from checkpoint"):] if "Resumed from checkpoint" in log else log
 check("finished without error",
-      "Traceback" not in log and ("Training finished" in log or adapter))
+      "Traceback" not in last_part and ("Training finished" in log or adapter))
 
 gate = re.findall(r"\[GateHook\] logits shape=torch.Size\(\[(\d+), (\d+)\]\)",
                   log)
