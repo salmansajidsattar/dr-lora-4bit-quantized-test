@@ -47,7 +47,7 @@ import transformers
 from accelerate import Accelerator, DataLoaderConfiguration
 from accelerate.accelerator import GradientAccumulationPlugin
 from accelerate.logging import get_logger
-from accelerate.utils import InitProcessGroupKwargs, set_seed
+from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs, set_seed
 from huggingface_hub import HfApi
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from rich.pretty import pprint
@@ -389,10 +389,20 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                     if grad is None: return
                     with torch.no_grad():
                         s = (grad * weight).sum(dim=1 if is_lora_A else 0).abs()
+                        # [fix] fp16 training multiplies gradients by the GradScaler factor,
+                        # and its first steps overflow to inf/NaN (the optimizer skips them).
+                        # Undo the factor and ignore non-finite steps, so the scores match
+                        # bf16 training. Runs on the GPU without waiting for it.
+                        scaler = getattr(accelerator, "scaler", None)
+                        if scaler is not None and getattr(scaler, "_scale", None) is not None:
+                            s = s / scaler._scale.to(s.device)
+                        ok = torch.isfinite(s).all()
+                        s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
                         if beta > 0:
-                            score_buf.mul_(beta).add_((1.0 - beta) * s)
+                            updated = score_buf * beta + (1.0 - beta) * s
                         else:
-                            score_buf.add_(s)
+                            updated = score_buf + s
+                        score_buf.copy_(torch.where(ok, updated, score_buf))
                 return grad_hook
 
             A.register_hook(create_hook(score, A, is_lora_A=True, beta=adalora_beta))
@@ -538,7 +548,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         if not os.path.exists(path):
             logger.warning(f"[AdaLoRA] No AdaLoRA state file found at {path}, skipping restore.")
             return
-        loaded = torch.load(path, map_location=accelerator.device)
+        loaded = torch.load(path, map_location="cpu")  # [2-GPU patch] copied to each GPU below
         name2entry = {entry["name"]: entry for layer_info in adalora_state["layers"].values() for entry in
                       layer_info["modules"]}
         restored_cnt = 0
@@ -569,6 +579,83 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         if accelerator.is_main_process:
             total_usage = float(sum(usage.values())) if usage else 0.0
             logger.info(f"[DEBUG][expert_usage] sum={total_usage:.4f}, num_entries={len(usage)}")
+
+    # ---------------- [2-GPU patch] keep DR-LoRA the same on every GPU ----------------
+    # With 2 GPUs (DDP) each GPU trains on its own half of the batch. DDP averages the
+    # LoRA gradients, but DR-LoRA's own state (expert usage, active experts, growth
+    # scores, rank masks) is computed on each GPU separately. These helpers combine it,
+    # so both GPUs make the same growth decision and the model copies never drift apart.
+    # On 1 GPU none of them is called.
+    def _ddp_on():
+        return (accelerator.num_processes > 1 and torch.distributed.is_available()
+                and torch.distributed.is_initialized())
+
+    def _all_expert_modules(adalora_state):
+        # same order on every GPU (built from named_modules)
+        return [e["module"] for li in adalora_state["layers"].values() for e in li["modules"]]
+
+    def _ddp_sync_usage(active_union, window_usage_incr, n_layers, n_experts):
+        """Add up expert token counts from all GPUs. An expert is active if any GPU used it."""
+        t = torch.zeros(2, n_layers, n_experts, dtype=torch.float32)
+        for (L, e), c in window_usage_incr.items():
+            t[0, L, e] += float(c)
+        for L, ss in active_union.items():
+            for e in ss:
+                t[1, L, e] = 1.0
+        t = t.to(accelerator.device)
+        torch.distributed.all_reduce(t)
+        t = t.cpu()
+        new_active, new_usage = defaultdict(set), defaultdict(float)
+        for L, e in torch.nonzero(t[1] > 0).tolist():
+            new_active[L].add(e)
+        for L, e in torch.nonzero(t[0] > 0).tolist():
+            new_usage[(L, e)] = float(t[0, L, e])
+        return new_active, new_usage
+
+    def _ddp_mean_scores(adalora_state):
+        """Average the growth scores over GPUs (each GPU only saw its own gradients)."""
+        bufs = [m._adalora_score for m in _all_expert_modules(adalora_state)]
+        flat = torch.cat([b.reshape(-1) for b in bufs])
+        torch.distributed.all_reduce(flat)
+        flat /= accelerator.num_processes
+        off = 0
+        for b in bufs:
+            n = b.numel()
+            b.copy_(flat[off:off + n].view_as(b))
+            off += n
+
+    def _ddp_share_masks(adalora_state, grown, saturated, step):
+        """Copy GPU 0's rank masks to every GPU and report if they differed."""
+        masks = [m._adalora_active_mask for m in _all_expert_modules(adalora_state)]
+        local = torch.cat([m.reshape(-1) for m in masks]).to(torch.uint8)
+        flat = local.clone()
+        flags = torch.tensor([int(grown), int(saturated)], dtype=torch.long, device=flat.device)
+        torch.distributed.broadcast(flat, src=0)
+        torch.distributed.broadcast(flags, src=0)
+        n_diff = (flat != local).sum().to(torch.long).reshape(1)
+        torch.distributed.all_reduce(n_diff)
+        off = 0
+        for m in masks:
+            n = m.numel()
+            m.copy_(flat[off:off + n].view_as(m).bool())
+            off += n
+        logger.info(f"[DDP-sync] step {step}: rank masks "
+                    f"{'identical' if int(n_diff) == 0 else 'DIFFERED (' + str(int(n_diff)) + ' dims), fixed'} "
+                    f"on {accelerator.num_processes} GPUs, grown={int(flags[0])}")
+        return int(flags[0]), bool(flags[1])
+
+    def _ddp_check_weights(model, step):
+        """Log whether the LoRA weights are the same on every GPU (they should be)."""
+        total = torch.zeros(1, dtype=torch.float64, device=accelerator.device)
+        for n, p in model.named_parameters():
+            if "lora_" in n:
+                total += p.detach().double().sum()
+        allv = [torch.zeros_like(total) for _ in range(accelerator.num_processes)]
+        torch.distributed.all_gather(allv, total)
+        vals = [float(v) for v in allv]
+        same = max(vals) == min(vals)
+        logger.info(f"[DDP-sync] step {step}: LoRA weights "
+                    f"{'identical' if same else 'DIFFER'} on {len(vals)} GPUs (checksums {vals})")
 
     def _adalora_grow_once_per_layer(adalora_state, usage_alpha: float = 1.0, score_beta: float = 1.0,
                                      rank_gamma: float = 1.2, module_grow_frac: float = 0.10,
@@ -749,6 +836,10 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         dataloader_config=DataLoaderConfiguration(use_seedable_sampler=True),
         gradient_accumulation_plugin=GradientAccumulationPlugin(num_steps=args.gradient_accumulation_steps,
                                                                 sync_each_batch=args.sync_each_batch),
+        # [2-GPU patch] each batch uses only some experts, so some LoRA weights get no
+        # gradient on a GPU; DDP must be told. Longer timeout for the model download.
+        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True),
+                         InitProcessGroupKwargs(timeout=timedelta(hours=2))],
         **({"log_with": args.report_to, "project_dir": args.output_dir} if args.with_tracking else {})
     )
 
@@ -799,7 +890,10 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         **quant_kwargs
     )
     if args.use_qlora:
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
+        # [2-GPU patch] DDP with find_unused_parameters needs non-reentrant checkpointing
+        model = prepare_model_for_kbit_training(
+            model, use_gradient_checkpointing=args.gradient_checkpointing,
+            gradient_checkpointing_kwargs={"use_reentrant": False} if accelerator.num_processes > 1 else None)
     embedding_size = model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=8)
@@ -867,7 +961,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 f"  Linear layer suffixes in model: {_found_linear_names}"
             )
     elif args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False} if accelerator.num_processes > 1 else None)
 
     # --- 3. Re-init LoRA weights BEFORE prepare ---
     if args.use_lora and args.use_adalora:
@@ -1041,6 +1136,13 @@ def main(args: FlatArguments, tc: TokenizerConfig):
 
     # --- 6. Init AdaLoRA state AFTER prepare ---
     adalora_state = _init_adalora_state(model, args) if args.use_lora and args.use_adalora else None
+    # [2-GPU patch] layer and expert counts, for combining expert usage across GPUs
+    _cfg = accelerator.unwrap_model(model).config
+    moe_dims = (_cfg.num_hidden_layers,
+                getattr(_cfg, "num_experts", None) or getattr(_cfg, "num_local_experts", 0))
+    if accelerator.num_processes > 1:
+        logger.info(f"[DDP-sync] {accelerator.num_processes} GPUs; DR-LoRA state is combined "
+                    f"across them (layers, experts = {moe_dims})")
 
     # --- Training Plan ---
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1145,6 +1247,9 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                         _adalora_mask_pruned_grads(adalora_state)
 
                     if args.lora_topk_only:
+                        if _ddp_on():  # [2-GPU patch] usage and active experts from all GPUs
+                            active_union, window_usage_incr = _ddp_sync_usage(
+                                active_union, window_usage_incr, *moe_dims)
                         _zero_inactive_expert_lora_grads(model, active_union)
                         if adalora_state:
                             _adalora_update_expert_usage(adalora_state, window_usage_incr,
@@ -1155,8 +1260,13 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                     in_grow_window = adalora_grow_start_step > 0 and adalora_grow_start_step <= next_step <= adalora_grow_end_step
                     if adalora_state and in_grow_window and (
                             next_step - adalora_grow_start_step) % args.adalora_grow_interval == 0:
+                        if _ddp_on():  # [2-GPU patch] same scores on every GPU
+                            _ddp_mean_scores(adalora_state)
                         grown, saturated = _adalora_grow_once_per_layer(adalora_state,
                                                                         module_grow_frac=args.adalora_module_grow_frac)
+                        if _ddp_on():  # [2-GPU patch] same masks on every GPU
+                            grown, saturated = _ddp_share_masks(adalora_state, grown, saturated, next_step)
+                            _ddp_check_weights(model, next_step)
                         if grown > 0:
                             for layer_info in adalora_state["layers"].values():
                                 for entry in layer_info["modules"]:
@@ -1201,6 +1311,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                     ckpt_dir = os.path.join(args.output_dir, f"step_{completed_steps}")
                     accelerator.save_state(ckpt_dir)
                     if adalora_state:
+                        if _ddp_on():  # [2-GPU patch] save the scores of all GPUs
+                            _ddp_mean_scores(adalora_state)
                         _save_adalora_state(adalora_state, ckpt_dir, accelerator)
                     _save_hf_eval_checkpoint(accelerator, model, tokenizer, ckpt_dir, args.freeze_moe_router)
                     accelerator.wait_for_everyone()
@@ -1215,6 +1327,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             output_dir_epoch = os.path.join(args.output_dir, f"epoch_{epoch}")
             accelerator.save_state(output_dir_epoch)
             if adalora_state:
+                if _ddp_on():  # [2-GPU patch]
+                    _ddp_mean_scores(adalora_state)
                 _save_adalora_state(adalora_state, output_dir_epoch, accelerator)
             _save_hf_eval_checkpoint(accelerator, model, tokenizer, output_dir_epoch, args.freeze_moe_router)
             accelerator.wait_for_everyone()

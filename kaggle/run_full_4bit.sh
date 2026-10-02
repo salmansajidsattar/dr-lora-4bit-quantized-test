@@ -1,15 +1,17 @@
 #!/bin/bash
-# Full-length DR-LoRA run on 4-bit OLMoE-1B-7B, one Kaggle T4 (~9 h).
+# Full-length DR-LoRA run on 4-bit OLMoE-1B-7B, both Kaggle T4s (~9 h).
 # Paper schedule (3,750 steps, growth every 200, warm-up 3%, lr 2e-5,
-# rank 8 -> 16, max 32) but batch 4 instead of 48: 15,000 examples
-# (one pass), not 180,000. Saves a checkpoint every 250 steps; running
-# this script again resumes from the latest one.
+# rank 8 -> 16, max 32) but batch 8 (4 per GPU) instead of 48:
+# 30,000 examples (one pass), not 180,000. Saves a checkpoint every
+# 250 steps; running this script again resumes from the latest one.
 # Usage:  !bash dr-lora/kaggle/run_full_4bit.sh
+#         !NGPU=1 bash dr-lora/kaggle/run_full_4bit.sh   (old 1-GPU run, 15,000 examples)
 set -euo pipefail
 
 WORK=${WORK:-/kaggle/working}
 REPO=$(cd "$(dirname "$0")/.." && pwd)
-export N_SAMPLES=${N_SAMPLES:-15000}
+export NGPU=${NGPU:-2}
+export N_SAMPLES=${N_SAMPLES:-$((15000 * NGPU))}   # 3,750 steps x 4 per GPU x NGPU
 export DATA=${DATA:-$WORK/data/metamathqa_gsm8k_${N_SAMPLES}.jsonl}
 
 if [ ! -s "$DATA" ]; then

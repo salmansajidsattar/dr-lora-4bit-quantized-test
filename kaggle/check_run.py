@@ -48,9 +48,27 @@ grew_files = False
 if logs:
     last = json.load(open(logs[-1]))["per_module_rank"].values()
     grew_files = any(m["active_rank"] > R_INIT for m in last)
-check("ranks grew", events >= MIN_EVENTS or (not grows and grew_files),
+# DR-LoRA's code stops growing once a layer reaches its target rank
+# total, which in a full run happens after about half the planned events.
+final = {}
+for lid, after, target in re.findall(
+        r"layer (\d+): grew \d+ ranks.*?total_rank: \d+ -> (\d+), "
+        r"target_total=(\d+)", log):
+    final[lid] = (int(after), int(target))
+reached = len(final) == N_LAYERS and all(a >= t for a, t in final.values())
+check("ranks grew", events >= MIN_EVENTS or reached
+      or (not grows and grew_files),
       f"({events} growth events x {N_LAYERS} layers in log; "
+      f"all layers reached target: {reached}; "
       f"rank files show growth: {grew_files})")
+check("no NaN growth scores", "layer_score_sum=nan" not in log)
+
+# 2-GPU runs: both GPUs must keep the same rank masks and LoRA weights
+ddp = re.findall(r"\[DDP-sync\] step (\d+): (rank masks|LoRA weights) (\S+)", log)
+if ddp:
+    bad = [f"step {st}: {what} {res}" for st, what, res in ddp if res != "identical"]
+    check("2 GPUs in sync", not bad,
+          f"({len(ddp) // 2} growth events checked" + (f"; {bad[:3]}" if bad else "") + ")")
 
 losses = [float(x) for x in
           re.findall(r"Step: \d+, Loss: ([0-9.eE+-]+|nan|inf)", log)]
@@ -76,6 +94,6 @@ speed = re.findall(r"(\d+\.\d+)s/it", log)
 if speed:
     sec = float(speed[-1])
     print(f"time per step ~{sec:.1f} s -> 3,750 steps ~{sec * 3750 / 3600:.1f} h "
-          f"(batch 4)")
+          f"(batch 4 per GPU)")
 print("\nALL CHECKS PASSED" if all_ok
       else "\nSOME CHECKS FAILED: send train_test.log")

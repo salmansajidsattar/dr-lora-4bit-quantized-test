@@ -56,20 +56,28 @@ A longer run reuses the same script with environment variables:
 !MIN_EVENTS=5 python /kaggle/working/dr-lora/kaggle/check_run.py
 ```
 
-## Full run (about 9 h) and GSM8K evaluation
+## Full run (about 9–10 h, both T4s) and GSM8K evaluation
 
-**Training: the paper's schedule at batch 4.**
+**Training: the paper's schedule at batch 8 (4 per GPU, 2 T4s).**
 - Same as the paper: 3,750 steps, growth every 200 steps after 3% warm-up (18 events), lr 2e-5, rank 8 → 16, max rank 32.
-- Different: batch 4 instead of 48, so it sees 15,000 MetaMathQA examples (one pass) instead of 180,000.
+- Different: batch 8 instead of 48, so it sees 30,000 MetaMathQA examples (one pass) instead of 180,000.
+- Set the notebook accelerator to **GPU T4 x2**. `NGPU=1` gives the old 1-GPU run (batch 4, 15,000 examples).
 - A checkpoint is saved every 250 steps; running the script again resumes from the latest one.
 
-The run takes about 9 hours, so use **Save Version → Save & Run All** (runs in the background, up to 12 h). Notebook cells:
+Test both GPUs first (20 steps, a few minutes); `check_run.py` then also checks "2 GPUs in sync" and prints the time per step:
+
+```
+!NGPU=2 bash /kaggle/working/dr-lora-4bit-quantized-test/kaggle/run_test_4bit.sh
+!python /kaggle/working/dr-lora-4bit-quantized-test/kaggle/check_run.py
+```
+
+The run takes about 9 hours, so use **Save Version → Save & Run All** (runs in the background, up to 12 h). Do not run it in an interactive session: when that session ends, `/kaggle/working` is deleted and the trained adapter is lost. Only a saved version keeps its files (Output tab). Notebook cells:
 
 ```
 !git clone https://github.com/<you>/<repo>.git /kaggle/working/dr-lora-4bit-quantized-test
 !bash /kaggle/working/dr-lora-4bit-quantized-test/kaggle/setup.sh
 !bash /kaggle/working/dr-lora-4bit-quantized-test/kaggle/run_full_4bit.sh
-!OUT=/kaggle/working/out_drlora_4bit_full LOG=/kaggle/working/train_full.log MIN_EVENTS=18 python /kaggle/working/dr-lora-4bit-quantized-test/kaggle/check_run.py
+!OUT=/kaggle/working/out_drlora_4bit_full LOG=/kaggle/working/train_full.log python /kaggle/working/dr-lora-4bit-quantized-test/kaggle/check_run.py
 ```
 
 **Evaluation** (`eval_gsm8k_4bit.py`) matches DR-LoRA's `eval/eval_gsm8k.sh`: lm-eval `gsm8k_cot`, 8-shot, greedy, chat template on, batch 8. It loads the 4-bit base, the saved adapter and the trained router. Run it in a new session, with the training version's output added as input:
@@ -91,4 +99,16 @@ In transformers 5, OLMoE stores its 64 experts as one combined tensor. DR-LoRA a
 
 - **Routing frequency:** the code counts hard top-k picks; the paper uses routing weights.
 - **Rank importance:** the code adds the A-side and B-side terms; the paper multiplies them.
-- **Growth quota:** the code counts the quota per expert but checks the target per module. Layers therefore reach their target early and can overshoot it slightly.
+- **Growth quota:** the code counts the quota per expert but checks the target per module. Layers therefore reach their target early and can overshoot it slightly. In the full run, growth stops after 9 of the 18 planned events (around step 1,712); `check_run.py` passes when every layer reaches its target.
+
+## Two GPUs (DDP)
+
+DDP averages the LoRA gradients, but DR-LoRA's own state is computed on each GPU from its half of the batch. The code (marked `[2-GPU patch]`) combines it so both GPUs make the same growth decision:
+- expert usage counts and active experts are added up over both GPUs every step;
+- growth scores are averaged over both GPUs before each growth event and before saving;
+- after growth, GPU 0's rank masks are copied to GPU 1, and the log reports `[DDP-sync] ... identical` for the masks and the LoRA weights;
+- DDP runs with `find_unused_parameters=True` (unused experts get no gradient) and non-reentrant gradient checkpointing.
+
+## Fixed for fp16 (T4)
+
+- **Rank importance under fp16:** fp16 training scales gradients by the GradScaler factor, and the first steps overflow. The gradient hooks saw these values, so layer 0's scores were NaN at the first growth event and its ranks went to experts 0–18 by index. The hooks now divide by the scale and skip non-finite steps (marked `[fix]`).

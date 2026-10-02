@@ -1,9 +1,10 @@
 #!/bin/bash
-# Short DR-LoRA test run on 4-bit OLMoE-1B-7B, one Kaggle T4.
+# Short DR-LoRA test run on 4-bit OLMoE-1B-7B on Kaggle T4s.
 # Paper settings (rank 8 -> 16, max 32, grow fraction 0.1, beta 0.9,
 # lr 2e-5, LoRA on up/down) except: few steps, growth every 5 steps,
-# batch 4, 4-bit NF4 + fp16.
-# Usage:  !bash dr-lora/kaggle/run_test_4bit.sh
+# batch 4 per GPU, 4-bit NF4 + fp16.
+# Usage:  !bash dr-lora/kaggle/run_test_4bit.sh          (1 GPU)
+#         !NGPU=2 bash dr-lora/kaggle/run_test_4bit.sh   (both T4s, batch 8)
 # Longer: !STEPS=300 GROW_EVERY=50 bash dr-lora/kaggle/run_test_4bit.sh
 set -euo pipefail
 
@@ -15,7 +16,12 @@ N_SAMPLES=${N_SAMPLES:-2000}
 DATA=${DATA:-$WORK/data/metamathqa_gsm8k_${N_SAMPLES}.jsonl}
 OUT=${OUT:-$WORK/out_drlora_4bit}
 LOG=${LOG:-$WORK/train_test.log}
-LAUNCH=${LAUNCH:-"--num_processes 1 --mixed_precision fp16"}
+NGPU=${NGPU:-1}                      # 2: one run on both T4s (DDP)
+if [ "$NGPU" -gt 1 ]; then
+    LAUNCH=${LAUNCH:-"--multi_gpu --num_processes $NGPU --mixed_precision fp16"}
+else
+    LAUNCH=${LAUNCH:-"--num_processes 1 --mixed_precision fp16"}
+fi
 OPTIM_8BIT=${OPTIM_8BIT:-True}      # bitsandbytes 8-bit AdamW (GPU only)
 SEQ_LEN=${SEQ_LEN:-512}
 WARMUP=${WARMUP:-0.1}                # paper: 0.03
@@ -26,7 +32,20 @@ RESUME=${RESUME:-0}                  # 1: keep $OUT and resume from its checkpoi
 export HF_HOME=${HF_HOME:-/kaggle/tmp/hf}   # 14 GB model, off /kaggle/working
 export WANDB_MODE=disabled TOKENIZERS_PARALLELISM=false
 export PYTHONPATH="$WORK/open-instruct"
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+if [ "$NGPU" -gt 1 ]; then
+    # use GPUs 0..NGPU-1, even if the platform already set CUDA_VISIBLE_DEVICES
+    export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((NGPU - 1)))
+    if command -v nvidia-smi >/dev/null; then
+        FOUND=$(nvidia-smi -L | wc -l)
+        if [ "$FOUND" -lt "$NGPU" ]; then
+            echo "ERROR: NGPU=$NGPU but only $FOUND GPU(s) found. Set Accelerator to 'GPU T4 x2'."
+            exit 1
+        fi
+    fi
+else
+    export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+fi
+echo "NGPU=$NGPU  CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES  launch: $LAUNCH"
 mkdir -p "$HF_HOME"
 if [ "$RESUME" = "1" ]; then
     echo "resuming if a checkpoint exists in $OUT"
@@ -39,10 +58,15 @@ if [ -n "$CKPT_EVERY" ]; then
     CKPT_ARGS="--checkpointing_steps $CKPT_EVERY --keep_last_n_checkpoints 1"
 fi
 
-# GPU memory every 5 s, for the check script
+# Download the model once, before the GPU processes start (not twice at the same time)
+if [ -n "${MODEL##/*}" ]; then
+    python -c "from huggingface_hub import snapshot_download; snapshot_download('$MODEL')"
+fi
+
+# GPU memory every 5 s (all GPUs used), for the check script
 MEM_PID=""
 if command -v nvidia-smi >/dev/null; then
-    nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0 -l 5 \
+    nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$CUDA_VISIBLE_DEVICES" -l 5 \
         > "$WORK/gpu_mem.csv" &
     MEM_PID=$!
 fi
@@ -53,7 +77,7 @@ accelerate launch $LAUNCH open_instruct/finetune_colm.py \
     --dataset_mixer_list "$DATA" 1.0 --dataset_mixer_list_splits train \
     --dataset_skip_cache True --chat_template_name tulu --add_bos True \
     --use_flash_attn False --max_seq_length "$SEQ_LEN" --preprocessing_num_workers 2 \
-    --per_device_train_batch_size 4 --gradient_accumulation_steps 1 \
+    --per_device_train_batch_size ${BATCH:-4} --gradient_accumulation_steps 1 \
     --learning_rate 2e-5 --lr_scheduler_type linear --warmup_ratio "$WARMUP" \
     --weight_decay 0.0 --max_train_steps "$STEPS" --logging_steps "$LOG_EVERY" $CKPT_ARGS \
     --seed 42 --low_cpu_mem_usage True --output_dir "$OUT" \
