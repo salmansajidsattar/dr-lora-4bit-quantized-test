@@ -9,6 +9,7 @@ Usage (Kaggle):
   !python dr-lora/kaggle/eval_gsm8k_4bit.py --limit 50     # timing test
   !python dr-lora/kaggle/eval_gsm8k_4bit.py                # all 1,319
   !python dr-lora/kaggle/eval_gsm8k_4bit.py --no_adapter   # 4-bit base
+  !bash dr-lora/kaggle/eval_2gpu.sh <run_dir>              # all, 2 GPUs
 """
 
 import argparse
@@ -39,6 +40,11 @@ def parse_args():
     p.add_argument("--no_quant", action="store_true",
                    help="CPU tests only: load the base without 4-bit")
     p.add_argument("--out", default=f"{WORK}/eval_gsm8k")
+    # 2 GPUs: part 0 scores questions 0, 2, 4, ... and part 1 scores 1, 3, 5, ...
+    p.add_argument("--part", type=int, default=0)
+    p.add_argument("--parts", type=int, default=1)
+    p.add_argument("--n_docs", type=int, default=1319,
+                   help="number of test questions (GSM8K test = 1,319)")
     return p.parse_args()
 
 
@@ -89,10 +95,18 @@ def main():
     lm = HFLM(pretrained=model, tokenizer=tokenizer,
               batch_size=args.batch_size)
 
+    tasks = args.tasks.split(",")
+    samples = None
+    if args.parts > 1:
+        ids = list(range(args.part, args.n_docs, args.parts))
+        samples = {task: ids for task in tasks}
+        print(f"part {args.part} of {args.parts}: {len(ids)} questions")
+
     start = time.time()
     results = simple_evaluate(
-        model=lm, tasks=args.tasks.split(","), num_fewshot=8,
+        model=lm, tasks=tasks, num_fewshot=8,
         apply_chat_template=not args.no_adapter, limit=args.limit,
+        samples=samples,
         task_manager=TaskManager(include_path=args.include_path),
         log_samples=True,
     )
@@ -101,6 +115,8 @@ def main():
     name = "base_4bit" if args.no_adapter else "drlora_4bit"
     if args.limit:
         name += f"_limit{args.limit}"
+    if args.parts > 1:
+        name += f"_part{args.part}of{args.parts}"
     os.makedirs(args.out, exist_ok=True)
     with open(f"{args.out}/{name}.json", "w") as f:
         json.dump(results, f, indent=2, default=str)
